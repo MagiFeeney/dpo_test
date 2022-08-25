@@ -1,0 +1,87 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions.kl import kl_divergence
+
+
+class DPO():
+    def __init__(self,
+                 actor_critic,
+                 clip_param,
+                 dpo_epoch,
+                 num_mini_batch,
+                 lr=None,
+                 eps=None,
+                 max_grad_norm=None,
+                 use_clipped_critic_loss=True):
+
+        self.actor_critic = actor_critic
+        self.set_alias(actor_critic)
+
+        self.clip_param = clip_param
+        self.dpo_epoch = dpo_epoch
+        self.num_mini_batch = num_mini_batch
+        
+        self.max_grad_norm = max_grad_norm
+        self.use_clipped_critic_loss = use_clipped_critic_loss
+
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr, eps=eps)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr, eps=eps)
+
+    def set_alias(self, actor_critic):
+        self.actor  = actor_critic.base.actor
+        self.critic = actor_critic.base.critic        
+
+    def update(self, rollouts):
+
+        critic_loss_epoch = 0
+        actor_loss_epoch = 0
+        dist_entropy_epoch = 0
+
+        for e in range(self.dpo_epoch):
+            data_generator = rollouts.feed_forward_generator(self.num_mini_batch)
+
+            for sample in data_generator:
+                obs_batch, actions_batch, qvalues_batch, \
+                returns_batch, masks_batch, old_action_log_probs_batch, \
+                   = sample
+
+                # Reshape to do in a single forward pass for all steps
+                qvalues, action_log_probs, dist_entropy = self.actor_critic.evaluate_actions(
+                    obs_batch, actions_batch)
+                
+                ratio = torch.exp(action_log_probs -
+                                  old_action_log_probs_batch)
+                surr1 = ratio * qvalues_batch
+                clip_ratio = torch.clamp(ratio, 1.0 - self.clip_param,
+                                    1.0 + self.clip_param)
+                surr2 = clip_ratio * qvalues_batch
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                critic_loss = F.mse_loss(qvalues[0], returns_batch) + \
+                    F.mse_loss(qvalues[1], returns_batch)
+
+                # update the critic
+		self.critic_optimizer.zero_grad()
+		critic_loss.backward()
+		self.critic_optimizer.step()
+
+                # update the actor
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.parameters(),
+                                         self.max_grad_norm)
+                self.actor_optimizer.step()
+
+                critic_loss_epoch += critic_loss.item()
+                actor_loss_epoch += actor_loss.item()
+                dist_entropy_epoch += dist_entropy.item()
+
+        num_updates = self.dpo_epoch * self.num_mini_batch
+
+        critic_loss_epoch /= num_updates
+        actor_loss_epoch /= num_updates
+        dist_entropy_epoch /= num_updates
+
+        return critic_loss_epoch, actor_loss_epoch, dist_entropy_epoch
